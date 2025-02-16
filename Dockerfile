@@ -1,5 +1,7 @@
-# Use official Python image
-FROM python:3.9-slim
+# Use official Python image with a newer version for compatibility
+FROM python:3.10-slim
+
+# Install system dependencies including nodejs and npm for Prettier
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -7,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     nodejs \
     npm \
     && rm -rf /var/lib/apt/lists/*
-
+    
 # Set working directory
 WORKDIR /app
 
@@ -21,8 +23,8 @@ COPY . .
 # Create data directory
 RUN mkdir -p /data
 
-# Expose port
+# Expose port for FastAPI
 EXPOSE 8000
 
-# Run the application
-CMD ["python", "main.py"]
+# Run the application using uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

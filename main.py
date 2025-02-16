@@ -1,23 +1,46 @@
-# main.py
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException
 import os
 import json
 import aiohttp
 import re
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any
 import sqlite3
-from pathlib import Path
-import subprocess
 import glob
 from dotenv import load_dotenv
-import numpy as np
+import base64
+import subprocess
+import difflib
+from dateutil.parser import parse
+from fastapi.responses import PlainTextResponse
+import shutil
+import requests
+import pandas as pd
 from PIL import Image
-import io
+from markdown import markdown
+import duckdb
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
+app = FastAPI()
+
+# ---------------- Security Checks (B1 & B2) ----------------
+def check_safe_path(file_path):
+    """ Ensure the path is within the /data directory """
+    if not file_path.startswith("/data/"):
+        raise HTTPException(status_code=403, detail="Access outside /data is forbidden.")
+    return file_path
+
+# Disable deletion operations
+os.remove = lambda *args, **kwargs: (_ for _ in ()).throw(
+    HTTPException(status_code=403, detail="Deletion operations are not allowed.")
+)
+shutil.rmtree = lambda *args, **kwargs: (_ for _ in ()).throw(
+    HTTPException(status_code=403, detail="Deletion operations are not allowed.")
+)
+
+# ---------------- AI Proxy for LLM Interactions ----------------
 class AIProxy:
     def __init__(self, token: str):
         self.token = token
@@ -40,234 +63,110 @@ class AIProxy:
                 data = await response.json()
                 return data['choices'][0]['message']['content']
 
+# ---------------- Task Handler ----------------
 class TaskHandler:
     def __init__(self, ai_proxy: AIProxy):
         self.ai_proxy = ai_proxy
-        
-    async def handle_sort_contacts(self, task_description: str) -> Dict[str, Any]:
-        input_file = "/data/contacts.json"
-        output_file = "/data/contacts-sorted.json"
-        
-        with open(input_file, 'r') as f:
-            contacts = json.load(f)
-            
-        # Sort contacts by last_name, then first_name
-        sorted_contacts = sorted(
-            contacts,
-            key=lambda x: (x['last_name'], x['first_name'])
-        )
-        
-        with open(output_file, 'w') as f:
-            json.dump(sorted_contacts, f, indent=2)
-            
-        return {"status": "success", "contacts_sorted": len(sorted_contacts)}
 
-    async def handle_recent_logs(self, task_description: str) -> Dict[str, Any]:
-        log_dir = "/data/logs/"
-        output_file = "/data/logs-recent.txt"
+    async def handle_task(self, task_description: str) -> Dict[str, Any]:
+        lower_task = task_description.lower()
+        # Phase A Tasks
+        if "datagen" in lower_task or "generate data" in lower_task:
+            return await self.handle_datagen()
+        elif "format" in lower_task and "prettier" in lower_task:
+            return await self.handle_format_file()
+        elif "wednesday" in lower_task:
+            return await self.handle_count_wednesdays()
+        elif "contact" in lower_task and "sort" in lower_task:
+            return await self.handle_sort_contacts()
+        elif "log" in lower_task and "recent" in lower_task:
+            return await self.handle_recent_logs()
+        elif "markdown" in lower_task and "docs" in lower_task:
+            return await self.handle_extract_headers()
+        elif "email" in lower_task and "sender" in lower_task:
+            return await self.handle_extract_email()
+        elif ("credit" in lower_task and "card" in lower_task) or ("credit_card.png" in lower_task):
+            return await self.handle_extract_card(task_description)
+        elif "comment" in lower_task and "similar" in lower_task:
+            return await self.handle_similar_comments()
+        elif "ticket" in lower_task and "gold" in lower_task:
+            return await self.handle_ticket_sales()
         
-        # Get all log files and sort by modification time
-        log_files = glob.glob(f"{log_dir}*.log")
-        recent_logs = sorted(
-            log_files,
-            key=lambda x: os.path.getmtime(x),
-            reverse=True
-        )[:10]
-        
-        # Extract first line from each log
-        first_lines = []
-        for log_file in recent_logs:
-            with open(log_file, 'r') as f:
-                first_lines.append(f.readline().strip())
-                
-        # Write to output file
-        with open(output_file, 'w') as f:
-            f.write('\n'.join(first_lines))
-            
-        return {"status": "success", "logs_processed": len(first_lines)}
+        # Phase B Tasks
+        elif "fetch data" in lower_task or "api" in lower_task:
+            return await self.handle_fetch_api(task_description)
+        elif "clone" in lower_task or "git" in lower_task:
+            return await self.handle_git_operations(task_description)
+        elif "sql query" in lower_task or "run sql" in lower_task:
+            return await self.handle_run_sql(task_description)
+        elif "scrape" in lower_task or "extract website" in lower_task:
+            return await self.handle_scrape_website(task_description)
+        elif "resize image" in lower_task or "compress image" in lower_task:
+            return await self.handle_resize_image(task_description)
+        elif "transcribe audio" in lower_task:
+            return await self.handle_transcribe_audio(task_description)
+        elif "convert markdown" in lower_task or "md to html" in lower_task:
+            return await self.handle_md_to_html(task_description)
+        elif "filter csv" in lower_task:
+            return await self.handle_filter_csv(task_description)
+        else:
+            raise ValueError(f"Unknown task: {task_description}")
 
-    async def handle_extract_headers(self, task_description: str) -> Dict[str, Any]:
-        docs_dir = "/data/docs/"
-        output_file = "/data/docs/index.json"
-        
-        # Find all markdown files
-        md_files = glob.glob(f"{docs_dir}**/*.md", recursive=True)
-        headers = {}
-        
-        for md_file in md_files:
-            with open(md_file, 'r') as f:
-                content = f.read()
-                # Find first H1 header
-                match = re.search(r'^#\s+(.+)$', content, re.MULTILINE)
-                if match:
-                    # Remove /data/docs/ prefix from filename
-                    relative_path = os.path.relpath(md_file, docs_dir)
-                    headers[relative_path] = match.group(1)
-                    
-        with open(output_file, 'w') as f:
-            json.dump(headers, f, indent=2)
-            
-        return {"status": "success", "files_processed": len(headers)}
+    # ---------------- PHASE B HANDLERS ----------------
 
-    async def handle_extract_email(self, task_description: str) -> Dict[str, Any]:
-        input_file = "/data/email.txt"
-        output_file = "/data/email-sender.txt"
-        
-        with open(input_file, 'r') as f:
-            email_content = f.read()
-            
-        prompt = f"""Extract just the sender's email address from this email:
-        {email_content}
-        Return only the email address, nothing else."""
-        
-        email = await self.ai_proxy.get_completion(prompt)
-        
-        with open(output_file, 'w') as f:
-            f.write(email.strip())
-            
-        return {"status": "success", "email": email.strip()}
+    # B3: Fetch Data from API
+    async def handle_fetch_api(self, task_description: str) -> Dict[str, Any]:
+        url = "https://api.example.com"
+        output_file = check_safe_path("/data/output.json")
+        response = requests.get(url)
+        if response.status_code == 200:
+            with open(output_file, 'w') as f:
+                json.dump(response.json(), f, indent=2)
+            return {"status": "success", "output": output_file}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to fetch data")
 
-    async def handle_extract_card(self, task_description: str) -> Dict[str, Any]:
-        input_file = "/data/credit-card.png"
-        output_file = "/data/credit-card.txt"
-        
-        with open(input_file, 'rb') as f:
-            image_data = f.read()
-            
-        # Convert image to base64 for AI Proxy
-        image_base64 = base64.b64encode(image_data).decode()
-        
-        prompt = f"""Extract the credit card number from this image.
-        Return only the numbers, no spaces or other characters."""
-        
-        # Note: Adjust this based on actual AI Proxy image handling capabilities
-        card_number = await self.ai_proxy.get_completion(prompt)
-        
-        # Remove any non-digit characters
-        card_number = re.sub(r'\D', '', card_number)
-        
-        with open(output_file, 'w') as f:
-            f.write(card_number)
-            
-        return {"status": "success", "card_number": card_number}
-
-    async def handle_ticket_sales(self, task_description: str) -> Dict[str, Any]:
-        db_file = "/data/ticket-sales.db"
-        output_file = "/data/ticket-sales-gold.txt"
-        
-        conn = sqlite3.connect(db_file)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT SUM(units * price)
-            FROM tickets
-            WHERE type = 'Gold'
-        """)
-        
-        total_sales = cursor.fetchone()[0]
-        conn.close()
-        
-        with open(output_file, 'w') as f:
-            f.write(str(total_sales))
-            
-        return {"status": "success", "total_sales": total_sales}
-
-    # Phase B Business Tasks
-    async def handle_api_fetch(self, task_description: str) -> Dict[str, Any]:
-        # Extract API details using LLM
-        prompt = f"""From this task: '{task_description}'
-        Extract:
-        1. API URL
-        2. Output file path
-        Return as JSON: {{"url": "...", "output": "..."}}"""
-        
-        params = json.loads(await self.ai_proxy.get_completion(prompt))
-        
-        # Ensure output path is in /data
-        if not params['output'].startswith('/data/'):
-            params['output'] = f"/data/{params['output']}"
-            
-        async with aiohttp.ClientSession() as session:
-            async with session.get(params['url']) as response:
-                data = await response.text()
-                
-        with open(params['output'], 'w') as f:
-            f.write(data)
-            
-        return {"status": "success", "bytes_written": len(data)}
-
+    # B4: Clone a Git Repo and Commit
     async def handle_git_operations(self, task_description: str) -> Dict[str, Any]:
-        # Only allow operations in /data directory
-        work_dir = "/data/git_repos"
-        os.makedirs(work_dir, exist_ok=True)
-        
-        # Extract git operations using LLM
-        prompt = f"""From this task: '{task_description}'
-        Extract:
-        1. Repository URL
-        2. Commit message
-        Return as JSON: {{"repo": "...", "message": "..."}}"""
-        
-        params = json.loads(await self.ai_proxy.get_completion(prompt))
-        
-        # Clone repo
-        repo_name = params['repo'].split('/')[-1].replace('.git', '')
-        repo_path = os.path.join(work_dir, repo_name)
-        
-        subprocess.run(['git', 'clone', params['repo'], repo_path], check=True)
-        
-        # Make commit
-        os.chdir(repo_path)
-        subprocess.run(['git', 'add', '.'], check=True)
-        subprocess.run(['git', 'commit', '-m', params['message']], check=True)
-        
-        return {"status": "success", "repo": repo_name}
+        repo_url = "https://github.com/user/repo.git"
+        repo_dir = check_safe_path("/data/repo")
+        subprocess.run(["git", "clone", repo_url, repo_dir], check=True)
+        subprocess.run(["git", "commit", "-am", "Automated commit"], cwd=repo_dir, check=True)
+        return {"status": "success", "repo": repo_dir}
 
-app = FastAPI()
-ai_proxy = AIProxy(os.environ["AIPROXY_TOKEN"])
+    # B5: Run SQL Query on SQLite or DuckDB
+    async def handle_run_sql(self, task_description: str) -> Dict[str, Any]:
+        db_file = check_safe_path("/data/database.db")
+        query = "SELECT * FROM table_name;"
+        conn = duckdb.connect(db_file)
+        result = conn.execute(query).fetchall()
+        conn.close()
+        return {"status": "success", "result": result}
+
+# ---------------- GLOBAL INIT ----------------
+ai_proxy = AIProxy(os.environ.get("AIPROXY_TOKEN", ""))
 task_handler = TaskHandler(ai_proxy)
 
 @app.post("/run")
 async def run_task(task: str):
     try:
-        # Security check: ensure task only accesses /data directory
-        if re.search(r'(?i)/(?!data/)[a-z]+/', task):
-            raise HTTPException(
-                status_code=400,
-                detail="Access denied: Operations restricted to /data directory"
-            )
-            
-        # Identify and execute task
         result = await task_handler.handle_task(task)
         return {"status": "success", "result": result}
-        
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/read")
+@app.get("/read", response_class=PlainTextResponse)
 async def read_file(path: str):
-    try:
-        # Security check: ensure path is within /data
-        if not path.startswith("/data/"):
-            raise HTTPException(
-                status_code=400,
-                detail="Access denied: Path must be within /data directory"
-            )
-            
-        if not os.path.exists(path):
-            raise HTTPException(status_code=404, detail=f"File not found: {path}")
-            
-        with open(path, 'r') as file:
-            content = file.read()
-            return content
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    if not path.startswith("/data/"):
+        raise HTTPException(status_code=400, detail="Access denied: Path must be within /data directory")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+    with open(path, 'r') as file:
+        content = file.read().strip()
+    return content
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the LLM-based Automation Agent API"}
